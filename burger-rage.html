@@ -1,0 +1,958 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>BURGER RAGE - Batting Platform Game</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0d0500;
+  display: flex; align-items: center; justify-content: center;
+  height: 100vh; overflow: hidden;
+  font-family: Impact, 'Arial Black', Arial, sans-serif;
+}
+canvas { cursor: crosshair; display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+const W = 480, H = 640;
+canvas.width = W; canvas.height = H;
+
+function resize() {
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = (W * s) + 'px';
+  canvas.style.height = (H * s) + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+// ─── Constants ────────────────────────────────────────────────
+const GRAV       = 0.44;
+const MAX_CHARGE = 85;
+const MAX_POWER  = 21;
+const PLAT_GAP_Y = 88;
+
+// ─── Platform types ───────────────────────────────────────────
+// friction: per-frame vx multiplier when grounded (lower = stops faster)
+const T = {
+  BUN:     { col:'#E8A020', dark:'#9a5a05', friction:0.82, bounce:0.08 },
+  PATTY:   { col:'#6B3A2A', dark:'#3a1a08', friction:0.80, bounce:0.12 },
+  LETTUCE: { col:'#43A047', dark:'#1b5e20', friction:0.96, bounce:0.05, slip:true },
+  CHEESE:  { col:'#FFC107', dark:'#c68000', friction:0.84, bounce:0.55, bouncy:true },
+  TOMATO:  { col:'#E53935', dark:'#8a0000', friction:0.82, bounce:0.25 },
+  PICKLE:  { col:'#8BC34A', dark:'#558B2F', friction:0.82, bounce:0.10, crumble:true },
+  BACON:   { col:'#C83010', dark:'#7a1500', friction:0.82, bounce:0.10, solid:true },
+};
+const TYPES = Object.values(T);
+
+// ─── State ────────────────────────────────────────────────────
+let state      = 'title';
+let frame      = 0;
+let camY       = 0;
+let targetCamY = 0;
+let maxH       = 0;
+let highscore  = 0;
+let deathMsg   = '';
+let deathTimer = 0;
+let shakeX     = 0, shakeY = 0;
+
+let mouseX = W/2, mouseY = H/2;
+let charging = false;
+let chargeF  = 0;
+
+let flyMode = false;
+let everCheated = false;
+const flyKeys = {};
+let cheatBuf = '';
+let wonGame = false;
+
+// ─── Touch state ──────────────────────────────────────────────
+const DPAD_CX = 90, DPAD_CY = H - 100;
+const activeTouches = {};
+const touchFlyDir = { KeyW:false, KeyA:false, KeyS:false, KeyD:false };
+
+const CORNER = 90; // px — size of each corner tap zone
+const cornerTapped = new Set();
+let cornerTimer = -999; // frame when last corner was tapped
+
+function detectCorner(x, y) {
+  if (x < CORNER && y < CORNER)         return 'TL';
+  if (x > W-CORNER && y < CORNER)       return 'TR';
+  if (x < CORNER && y > H-CORNER)       return 'BL';
+  if (x > W-CORNER && y > H-CORNER)     return 'BR';
+  return null;
+}
+
+function toCanvas(touch) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (touch.clientX - r.left) * (W / r.width),
+           y: (touch.clientY - r.top)  * (H / r.height) };
+}
+function inDpad(cx, cy) {
+  return flyMode && cx < DPAD_CX + 70 && cy > DPAD_CY - 70;
+}
+function refreshDpad() {
+  touchFlyDir.KeyW = touchFlyDir.KeyA = touchFlyDir.KeyS = touchFlyDir.KeyD = false;
+  for (const id in activeTouches) {
+    const t = activeTouches[id];
+    if (!t.dpad) continue;
+    const dx = t.x - DPAD_CX, dy = t.y - DPAD_CY;
+    if (Math.abs(dx) > Math.abs(dy)) { if (dx > 0) touchFlyDir.KeyD = true; else touchFlyDir.KeyA = true; }
+    else                              { if (dy > 0) touchFlyDir.KeyS = true; else touchFlyDir.KeyW = true; }
+  }
+}
+
+let platforms = [];
+let particles = [];
+
+// ─── Particle ─────────────────────────────────────────────────
+class Particle {
+  constructor(x, y, kind) {
+    this.x = x; this.y = y;
+    const a = Math.random() * Math.PI * 2;
+    const s = 1.5 + Math.random() * 5;
+    this.vx = Math.cos(a) * s;
+    this.vy = Math.sin(a) * s - 2;
+    this.life = 1;
+    this.decay = 0.025 + Math.random() * 0.03;
+    this.r = 3 + Math.random() * 7;
+    const hue = kind === 'swing' ? 30 + Math.random()*40
+              : kind === 'land'  ? 110 + Math.random()*50
+              : 70 + Math.random()*40;
+    this.col = `hsl(${hue},85%,60%)`;
+  }
+  update() {
+    this.x += this.vx; this.y += this.vy;
+    this.vy += 0.18; this.life -= this.decay; this.r *= 0.96;
+  }
+  draw() {
+    const sy = this.y - camY;
+    ctx.globalAlpha = Math.max(0, this.life);
+    ctx.fillStyle = this.col;
+    ctx.beginPath(); ctx.arc(this.x, sy, this.r, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  dead() { return this.life <= 0 || this.r < 0.3; }
+}
+
+// ─── Platform ─────────────────────────────────────────────────
+class Platform {
+  constructor(x, y, w, type) {
+    this.x = x; this.y = y; this.w = w; this.h = 17;
+    this.type = type;
+    this.active = true;
+    this.crumbling = false; this.crumbleT = 0;
+    this.speed = 0; this.amp = 0; this.off = 0;
+    this.baseX = x; this.prevX = x;
+  }
+  setMoving(speed, amp) {
+    this.speed = speed; this.amp = amp;
+    this.off = Math.random() * Math.PI * 2;
+    this.baseX = this.x;
+  }
+  update() {
+    if (!this.active) return;
+    this.prevX = this.x;
+    if (this.speed) {
+      this.x = this.baseX + Math.sin(frame * this.speed + this.off) * this.amp;
+      if (this.x < 8) this.x = 8;
+      if (this.x + this.w > W - 8) this.x = W - 8 - this.w;
+    }
+    if (this.crumbling) {
+      this.crumbleT--;
+      if (this.crumbleT <= 0) {
+        this.active = false;
+        for (let i = 0; i < 14; i++)
+          particles.push(new Particle(this.x + Math.random()*this.w, this.y, 'crumble'));
+      }
+    }
+  }
+  draw() {
+    if (!this.active) return;
+    const sy = this.y - camY;
+    if (sy < -40 || sy > H + 40) return;
+    ctx.save();
+    ctx.globalAlpha = this.crumbling ? Math.max(0.15, this.crumbleT / 55) : 1;
+    const t = this.type;
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    ctx.beginPath();
+    ctx.ellipse(this.x + this.w/2, sy + this.h + 5, this.w/2, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    if (t === T.BUN) {
+      ctx.fillStyle = t.col;
+      ctx.beginPath(); ctx.roundRect(this.x, sy, this.w, this.h, [7,7,3,3]); ctx.fill();
+      ctx.fillStyle = t.dark;
+      ctx.beginPath(); ctx.roundRect(this.x+1, sy+this.h-5, this.w-2, 5, [0,0,3,3]); ctx.fill();
+      ctx.fillStyle = '#FFF3CD';
+      for (let i = 0; i < 4; i++) {
+        const sx2 = this.x + 14 + i*(this.w-22)/3;
+        ctx.save(); ctx.translate(sx2, sy+6); ctx.rotate(0.3);
+        ctx.beginPath(); ctx.ellipse(0,0,2.5,1.5,0,0,Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+    } else if (t === T.PATTY) {
+      ctx.fillStyle = t.col;
+      ctx.fillRect(this.x, sy+2, this.w, this.h-4);
+      ctx.fillStyle = t.dark;
+      ctx.fillRect(this.x, sy+2, this.w, 5);
+      ctx.strokeStyle = t.dark; ctx.lineWidth = 1.8;
+      for (let i = 0; i < 3; i++) {
+        const gx = this.x + 18 + i*(this.w-28)/2;
+        ctx.beginPath(); ctx.moveTo(gx, sy+4); ctx.lineTo(gx-4, sy+this.h-1); ctx.stroke();
+      }
+    } else if (t === T.LETTUCE) {
+      ctx.fillStyle = t.dark;
+      ctx.fillRect(this.x, sy+6, this.w, this.h-6);
+      ctx.fillStyle = t.col;
+      ctx.beginPath(); ctx.moveTo(this.x, sy+9);
+      for (let i = 0; i <= this.w; i += 10)
+        ctx.bezierCurveTo(this.x+i+2,sy+1, this.x+i+8,sy+1, this.x+i+10,sy+9);
+      ctx.lineTo(this.x+this.w, sy+this.h);
+      ctx.lineTo(this.x, sy+this.h); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = 'rgba(170,230,255,0.55)';
+      for (let i = 0; i < 3; i++) {
+        ctx.beginPath(); ctx.arc(this.x+14+i*(this.w-20)/2, sy+11, 2.8, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.fillStyle = 'rgba(200,240,255,0.9)'; ctx.font = '9px Arial'; ctx.textAlign = 'center';
+      ctx.fillText('SLIP!', this.x+this.w/2, sy-3);
+    } else if (t === T.CHEESE) {
+      ctx.fillStyle = t.col;
+      ctx.fillRect(this.x, sy, this.w, this.h);
+      ctx.fillStyle = t.dark;
+      for (let i = 0; i < 3; i++) {
+        ctx.beginPath(); ctx.ellipse(this.x+14+i*(this.w-20)/2, sy+9, 4.5, 3.5, 0, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.fillStyle = 'rgba(255,240,0,0.9)'; ctx.font = '9px Arial'; ctx.textAlign = 'center';
+      ctx.fillText('BOUNCE!', this.x+this.w/2, sy-3);
+    } else if (t === T.TOMATO) {
+      ctx.fillStyle = t.col;
+      ctx.beginPath(); ctx.roundRect(this.x, sy+3, this.w, this.h-3, 5); ctx.fill();
+      ctx.fillStyle = 'rgba(255,210,210,0.45)';
+      for (let i = 0; i < 4; i++) {
+        ctx.beginPath(); ctx.ellipse(this.x+12+i*(this.w-16)/3, sy+11, 3.5, 2, 0.3, 0, Math.PI*2); ctx.fill();
+      }
+    } else if (t === T.PICKLE) {
+      ctx.fillStyle = t.col;
+      ctx.fillRect(this.x, sy+3, this.w, this.h-6);
+      ctx.fillStyle = t.dark;
+      for (let i = 0; i < Math.floor(this.w/17); i++) {
+        ctx.beginPath(); ctx.arc(this.x+9+i*17, sy+3, 3.5, 0, Math.PI*2); ctx.fill();
+      }
+      ctx.fillStyle = 'rgba(255,140,0,0.85)'; ctx.font = '9px Arial'; ctx.textAlign = 'center';
+      ctx.fillText('CRUMBLES', this.x+this.w/2, sy-3);
+    } else { // BACON — full solid block, blocks head-on collision from below
+      // Dark lean meat base
+      ctx.fillStyle = t.dark;
+      ctx.beginPath(); ctx.roundRect(this.x, sy+2, this.w, this.h-4, 4); ctx.fill();
+      // Red meat layer
+      ctx.fillStyle = t.col;
+      ctx.fillRect(this.x, sy+4, this.w, this.h-8);
+      // Pink fat streaks (clipped to platform shape)
+      ctx.save();
+      ctx.beginPath(); ctx.roundRect(this.x, sy+2, this.w, this.h-4, 4); ctx.clip();
+      ctx.strokeStyle = '#f5b8a8'; ctx.lineWidth = 3;
+      for (let s = 0; s < 3; s++) {
+        const by = sy + 5 + s * 4;
+        ctx.beginPath(); ctx.moveTo(this.x, by);
+        for (let wx = 0; wx <= this.w; wx += 14)
+          ctx.lineTo(this.x + wx, by + Math.sin((wx + s*18) / 7) * 2.5);
+        ctx.stroke();
+      }
+      ctx.restore();
+      // Crispy edges
+      ctx.fillStyle = '#3a0800';
+      ctx.fillRect(this.x, sy+2, this.w, 2);
+      ctx.fillRect(this.x, sy+this.h-4, this.w, 2);
+      // Label
+      ctx.fillStyle = 'rgba(255,200,100,0.95)'; ctx.font = '9px Arial'; ctx.textAlign = 'center';
+      ctx.fillText('SOLID', this.x+this.w/2, sy-3);
+    }
+
+    if (this.speed > 0) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+      ctx.beginPath();
+      ctx.moveTo(this.baseX - this.amp, sy + this.h/2);
+      ctx.lineTo(this.baseX + this.w + this.amp, sy + this.h/2);
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+
+    ctx.restore();
+  }
+}
+
+// ─── Player ───────────────────────────────────────────────────
+const P = {
+  x: W/2, y: 0,
+  vx: 0, vy: 0,
+  w: 38, h: 32,
+  grounded: false,
+  onPlat: null,
+  canSwing: false,
+  facing: 1,
+  swingAnim: 0,
+  get L() { return this.x - this.w/2; },
+  get R() { return this.x + this.w/2; },
+  get T() { return this.y - this.h/2; },
+  get B() { return this.y + this.h/2; },
+
+  reset() {
+    this.x = W/2; this.y = platforms[0].y - this.h/2 - 3;
+    this.vx = 0; this.vy = 0;
+    this.grounded = false; this.onPlat = null;
+    this.canSwing = false; this.swingAnim = 0;
+    camY = 0; targetCamY = 0; maxH = 0;
+    charging = false; chargeF = 0;
+  },
+
+  launch(power, nx, ny) {
+    this.vx = nx * power; this.vy = ny * power;
+    this.grounded = false; this.onPlat = null;
+    this.canSwing = false; this.swingAnim = 28;
+    this.facing = nx >= 0 ? 1 : -1;
+    for (let i = 0; i < 12; i++) particles.push(new Particle(this.x, this.y, 'swing'));
+    shakeX = 3; shakeY = 3;
+  },
+
+  update() {
+    // ── Fly mode (cheat) ─────────────────────────────────────
+    if (flyMode) {
+      const spd = 5;
+      this.vx = ((flyKeys['KeyD']||touchFlyDir.KeyD) ? spd : 0) - ((flyKeys['KeyA']||touchFlyDir.KeyA) ? spd : 0);
+      this.vy = ((flyKeys['KeyS']||touchFlyDir.KeyS) ? spd : 0) - ((flyKeys['KeyW']||touchFlyDir.KeyW) ? spd : 0);
+      this.grounded = false; this.canSwing = true;
+      this.x += this.vx; this.y += this.vy;
+      if (this.L < 0) this.x = this.w/2;
+      if (this.R > W) this.x = W - this.w/2;
+      this.maxH = Math.max(this.maxH, -this.y);
+      targetCamY = this.y - H * 0.52;
+      return;
+    }
+
+    // ── Friction & gravity ───────────────────────────────────
+    if (!this.grounded) {
+      this.vy += GRAV; if (this.vy > 26) this.vy = 26;
+      this.vx *= 0.994;
+    } else if (this.onPlat) {
+      this.vx *= this.onPlat.type.friction;
+    }
+
+    this.x += this.vx; this.y += this.vy;
+    if (this.swingAnim > 0) this.swingAnim--;
+
+    // ── Walls ────────────────────────────────────────────────
+    if (this.L < 0)  { this.x = this.w/2;    this.vx =  Math.abs(this.vx)*0.55; for(let i=0;i<5;i++) particles.push(new Particle(0,this.y,'land')); }
+    if (this.R > W)  { this.x = W-this.w/2;  this.vx = -Math.abs(this.vx)*0.55; for(let i=0;i<5;i++) particles.push(new Particle(W,this.y,'land')); }
+
+    // ── Top collision — land on platforms ────────────────────
+    this.grounded = false;
+    for (const pl of platforms) {
+      if (!pl.active) continue;
+      if (this.vy >= -0.5 &&
+          this.B >= pl.y && this.B <= pl.y + 22 &&
+          this.R > pl.x + 5 && this.L < pl.x + pl.w - 5) {
+        this.y = pl.y - this.h/2;
+        const wasSwinging = !this.canSwing;
+        const impactVy = this.vy;
+        this.vy = -this.vy * pl.type.bounce;
+        if (Math.abs(this.vy) < 1.2) {
+          this.vy = 0;
+          this.grounded = true;
+          this.onPlat = pl;
+          if (wasSwinging) {
+            this.canSwing = true;
+            const count = Math.floor(Math.abs(impactVy)*0.6 + 6);
+            for (let i = 0; i < count; i++) particles.push(new Particle(this.x, this.B, 'land'));
+            if (impactVy > 12) { shakeX = 5; shakeY = 5; }
+          }
+        }
+        if (pl.type.crumble && !pl.crumbling) { pl.crumbling = true; pl.crumbleT = 55; }
+        break;
+      }
+    }
+
+    // ── Bottom collision — bacon blocks upward pass-through ──
+    // Use previous-frame T to detect crossing even at high speed
+    for (const pl of platforms) {
+      if (!pl.active || !pl.type.solid) continue;
+      const prevT = this.T - this.vy;
+      if (this.vy < 0 &&
+          prevT >= pl.y + pl.h &&
+          this.T  <= pl.y + pl.h &&
+          this.R > pl.x + 5 && this.L < pl.x + pl.w - 5) {
+        this.y = pl.y + pl.h + this.h/2;
+        this.vy = Math.abs(this.vy) * 0.35;
+        particles.push(new Particle(this.x, pl.y + pl.h, 'land'));
+        break;
+      }
+    }
+
+    // ── Ride moving platforms ────────────────────────────────
+    if (this.grounded && this.onPlat && this.onPlat.speed > 0) {
+      this.x += this.onPlat.x - this.onPlat.prevX;
+      if (this.L < 0) this.x = this.w/2;
+      if (this.R > W) this.x = W - this.w/2;
+    }
+
+    // ── Height score ─────────────────────────────────────────
+    const h = (platforms[0].y - this.y) / PLAT_GAP_Y;
+    if (h > maxH) maxH = h;
+
+    // ── Camera ───────────────────────────────────────────────
+    targetCamY = this.y - H * 0.52;
+
+    // ── Screen shake decay ───────────────────────────────────
+    shakeX *= 0.7; shakeY *= 0.7;
+  },
+
+  draw() {
+    const sy = this.y - camY + shakeY;
+    if (sy < -80 || sy > H + 80) return;
+    ctx.save();
+    ctx.translate(this.x + shakeX, sy);
+    ctx.scale(this.facing, 1);
+
+    // ── Bat ──────────────────────────────────────────────────
+    const showBat = this.swingAnim > 0 || (this.canSwing && charging);
+    if (showBat) {
+      ctx.save();
+      let ang;
+      if (this.swingAnim > 0) {
+        ang = (this.swingAnim/28) * Math.PI * 0.9 - 0.5;
+      } else {
+        const dx = (mouseX - this.x) * this.facing;
+        const dy = mouseY - (this.y - camY);
+        ang = Math.atan2(dy, dx) - Math.PI/2;
+        ang += Math.sin(frame * 0.3) * 0.08 * (chargeF/MAX_CHARGE);
+      }
+      ctx.rotate(ang);
+      ctx.fillStyle = '#4a1a00';
+      ctx.beginPath(); ctx.roundRect(-3, -2, 6, 44, 3); ctx.fill();
+      ctx.fillStyle = '#7B3B10';
+      ctx.beginPath(); ctx.roundRect(-8, -50, 16, 50, [8,8,3,3]); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.2)';
+      ctx.beginPath(); ctx.roundRect(-5,-48,5,44,4); ctx.fill();
+      ctx.strokeStyle = '#2a0a00'; ctx.lineWidth = 3;
+      for (let i=0;i<3;i++) { ctx.beginPath(); ctx.moveTo(-3,14+i*8); ctx.lineTo(3,17+i*8); ctx.stroke(); }
+      if (charging && chargeF > 0) {
+        const pct = chargeF/MAX_CHARGE;
+        ctx.shadowColor = pct > 0.7 ? '#ff3300' : '#ffaa00';
+        ctx.shadowBlur = pct * 22;
+        ctx.strokeStyle = pct > 0.7 ? '#ff5500' : '#ffcc00';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.roundRect(-8,-50,16,50,[8,8,3,3]); ctx.stroke();
+        ctx.shadowBlur = 0;
+      }
+      ctx.restore();
+    }
+
+    // ── Hamburger body ───────────────────────────────────────
+    // Draw order: bottom-bun → patty → cheese → lettuce → top-bun-dome
+    // Top bun drawn last so its flat edge visually contains the fillings.
+    const bw = this.w, bh = this.h;
+    const top = -bh/2, bot = bh/2; // top=-16, bot=16
+
+    // Bottom bun (y: 6→16, rounded bottom / flat top)
+    ctx.fillStyle = '#C8780A';
+    ctx.beginPath(); ctx.roundRect(-bw/2, 6, bw, 10, [0,0,6,6]); ctx.fill();
+    ctx.fillStyle = '#E89820';
+    ctx.fillRect(-bw/2+1, 6, bw-2, 5);
+
+    // Patty (y: 1→7, kept inside bun width)
+    ctx.fillStyle = '#52201A';
+    ctx.fillRect(-bw/2+1, 1, bw-2, 6);
+    ctx.strokeStyle = '#321008'; ctx.lineWidth = 1.5;
+    [-8, 0, 8].forEach(gx => {
+      ctx.beginPath(); ctx.moveTo(gx, 2); ctx.lineTo(gx-1, 6); ctx.stroke();
+    });
+    ctx.fillStyle = '#cc2200';
+    ctx.beginPath(); ctx.arc(8, 1, 2.5, 0, Math.PI*2); ctx.fill();
+
+    // Cheese (y: -4→2, same width as bun)
+    ctx.fillStyle = '#FFCA28';
+    ctx.fillRect(-bw/2, -4, bw, 6);
+
+    // Lettuce (y: -8→-1, wavy, same width as bun)
+    ctx.fillStyle = '#2E7D32';
+    ctx.beginPath(); ctx.moveTo(-bw/2+1, -1);
+    for (let i = 0; i <= bw-2; i += 9)
+      ctx.bezierCurveTo(-bw/2+1+i, -8, -bw/2+1+i+4.5, -8, -bw/2+1+i+9, -1);
+    ctx.lineTo(bw/2-1, 0); ctx.lineTo(-bw/2+1, 0); ctx.closePath(); ctx.fill();
+
+    // Top bun — upper half-ellipse, flat bottom at y=-4.
+    // Clockwise sweep from π→0 passes through 3π/2 (the top), making a dome.
+    ctx.fillStyle = '#C8780A';
+    ctx.beginPath();
+    ctx.ellipse(0, -4, bw/2, 12, 0, Math.PI, 0, false);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#E89820';
+    ctx.beginPath();
+    ctx.ellipse(0, -4, bw/2-3, 10, 0, Math.PI, 0, false);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(255,220,120,0.35)';
+    ctx.beginPath(); ctx.ellipse(-5, -12, 7, 4, -0.5, 0, Math.PI*2); ctx.fill();
+
+    // Sesame seeds (upper dome)
+    ctx.fillStyle = '#FFF3CD';
+    [[-9,-13],[0,-15],[9,-13],[-4,-10],[7,-10]].forEach(([sx2,sy2]) => {
+      ctx.save(); ctx.translate(sx2,sy2); ctx.rotate(0.4);
+      ctx.beginPath(); ctx.ellipse(0,0,2.2,1.3,0,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    });
+
+    // Eyes
+    ctx.fillStyle = '#1a0800';
+    ctx.beginPath(); ctx.arc(-7,-8,2.5,0,Math.PI*2); ctx.arc(7,-8,2.5,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = 'white';
+    ctx.beginPath(); ctx.arc(-6,-9,1,0,Math.PI*2); ctx.arc(8,-9,1,0,Math.PI*2); ctx.fill();
+
+    // Angry brows
+    ctx.strokeStyle = '#1a0800'; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(-12,-12); ctx.lineTo(-4,-10);
+    ctx.moveTo(4,-10);   ctx.lineTo(12,-12);
+    ctx.stroke();
+
+    // Mouth
+    ctx.strokeStyle = '#1a0800'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    if (this.vy > 9) {
+      ctx.arc(0, -5, 4, 0, Math.PI);
+    } else if (this.canSwing) {
+      ctx.moveTo(-5,-5); ctx.quadraticCurveTo(0,-8,5,-5);
+    } else {
+      ctx.moveTo(-5,-7); ctx.quadraticCurveTo(0,-4,5,-7);
+    }
+    ctx.stroke();
+
+    // ── Charge bar — drawn in unflipped space so it never mirrors ──
+    if (charging && this.canSwing) {
+      const pct = Math.min(chargeF/MAX_CHARGE, 1);
+      const bw2 = 52;
+      ctx.save();
+      ctx.scale(this.facing, 1); // cancel outer flip → unflipped space
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(-bw2/2, top-20, bw2, 11);
+      const cr = pct < 0.5 ? 0 : Math.round(255*(pct-0.5)*2);
+      const cg = pct < 0.5 ? Math.round(255*pct*2) : Math.round(255*(1-pct)*2);
+      ctx.fillStyle = `rgb(${cr},${cg},0)`;
+      ctx.fillRect(-bw2/2, top-20, bw2*pct, 11);
+      ctx.strokeStyle = 'white'; ctx.lineWidth = 1;
+      ctx.strokeRect(-bw2/2, top-20, bw2, 11);
+      ctx.fillStyle = 'white'; ctx.font = 'bold 8px Arial'; ctx.textAlign = 'center';
+      ctx.fillText(pct >= 1 ? 'MAX!' : 'CHARGE', 0, top-11);
+      ctx.restore();
+    }
+
+    ctx.restore();
+  }
+};
+
+// ─── Level generation ─────────────────────────────────────────
+function genLevel() {
+  platforms = [];
+  particles = [];
+
+  platforms.push(new Platform(W/2-75, H-90, 150, T.BUN));
+
+  let lastY = H - 90;
+  for (let i = 0; i < 85; i++) {
+    lastY -= PLAT_GAP_Y + Math.random()*45;
+    const diff = Math.min(i/18, 1);
+    const pw = Math.round(130 - diff*70 + Math.random()*30);
+    const px = 15 + Math.random()*(W - pw - 30);
+
+    let type;
+    const r = Math.random();
+    if (i < 4)       type = r < 0.7 ? T.BUN : T.PATTY;
+    else if (i < 12) type = r < 0.25 ? T.BUN : r < 0.55 ? T.PATTY : r < 0.75 ? T.TOMATO : T.CHEESE;
+    else if (i < 20) type = TYPES[Math.floor(Math.random()*(TYPES.length-1))]; // no bacon yet
+    else              type = TYPES[Math.floor(Math.random()*TYPES.length)];    // bacon included
+
+    const pl = new Platform(px, lastY, pw, type);
+    if (i > 8 && Math.random() < diff * 0.55) pl.setMoving(0.022+Math.random()*0.028, 25+Math.random()*55);
+    platforms.push(pl);
+  }
+
+  platforms.push(new Platform(W/2-90, lastY-110, 180, T.BUN));
+}
+
+// ─── Aim trajectory ───────────────────────────────────────────
+function drawAim() {
+  if (!charging || !P.canSwing) return;
+  const pct = Math.min(chargeF/MAX_CHARGE, 1);
+  if (pct < 0.04) return;
+  const power = pct * MAX_POWER;
+  const dx = mouseX - P.x;
+  const dy = mouseY - (P.y - camY);
+  const dist = Math.hypot(dx, dy);
+  if (dist < 1) return;
+  const nx = dx/dist, ny = dy/dist;
+
+  let sx = P.x, sy2 = P.y - camY;
+  let svx = nx*power, svy = ny*power;
+
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,255,180,0.55)';
+  ctx.lineWidth = 1.5; ctx.setLineDash([4,5]);
+  ctx.beginPath(); ctx.moveTo(sx, sy2);
+  for (let t = 0; t < 35; t++) {
+    svy += GRAV; svx *= 0.997; svy *= 0.997;
+    sx += svx; sy2 += svy;
+    if (sx < 0 || sx > W || sy2 > H+50) break;
+    ctx.lineTo(sx, sy2);
+  }
+  ctx.stroke(); ctx.setLineDash([]); ctx.restore();
+
+  ctx.beginPath();
+  ctx.arc(mouseX, mouseY, 5 + Math.sin(frame*0.15)*2, 0, Math.PI*2);
+  ctx.strokeStyle = `rgba(255,255,100,${0.5+pct*0.5})`;
+  ctx.lineWidth = 2; ctx.stroke();
+}
+
+// ─── Background ───────────────────────────────────────────────
+function drawBG() {
+  const prog = Math.min(Math.abs(camY)/6500, 1);
+  const r = Math.round(13 - 8*prog), g = Math.round(5 - 3*prog), b = Math.round(0 + 45*prog);
+  ctx.fillStyle = `rgb(${r},${g},${b})`;
+  ctx.fillRect(0, 0, W, H);
+
+  if (prog > 0.25) {
+    ctx.fillStyle = `rgba(255,255,255,${(prog-0.25)*0.7})`;
+    for (let i = 0; i < 60; i++) {
+      const sx = ((i*131 + camY*0.008) % W + W) % W;
+      const sy = ((i*89  + camY*0.015) % H + H) % H;
+      ctx.beginPath(); ctx.arc(sx, sy, 0.8+Math.sin(i)*0.4, 0, Math.PI*2); ctx.fill();
+    }
+  }
+
+  ctx.globalAlpha = 0.04;
+  ctx.font = '260px serif'; ctx.textAlign = 'center';
+  ctx.fillStyle = '#ff9900';
+  ctx.fillText('🍔', W/2, H/2 + 100 + Math.sin(frame*0.008)*30);
+  ctx.globalAlpha = 1;
+}
+
+// ─── HUD ──────────────────────────────────────────────────────
+function drawHUD() {
+  const h = Math.max(0, Math.floor(maxH));
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(8, 8, 145, 52);
+  ctx.fillStyle = '#ff7700'; ctx.font = 'bold 14px Impact'; ctx.textAlign = 'left';
+  ctx.fillText(`HEIGHT: ${h}m`, 16, 27);
+  ctx.fillStyle = '#ffdd00';
+  ctx.fillText(`BEST:   ${Math.floor(highscore)}m`, 16, 48);
+
+  if (!P.canSwing && !P.grounded && frame > 60) {
+    const pulse = Math.sin(frame*0.12)*0.35+0.65;
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = '#ff4444'; ctx.font = 'bold 13px Impact'; ctx.textAlign = 'center';
+    ctx.fillText('FIND A PLATFORM!', W/2, 75);
+    ctx.globalAlpha = 1;
+  }
+
+  if (frame < 380) {
+    ctx.fillStyle = 'rgba(255,255,255,0.65)'; ctx.font = '11px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('Hold SPACE / click to charge  •  Aim with mouse  •  Release!', W/2, H-20);
+    ctx.fillText('Land on a platform to recharge your bat', W/2, H-5);
+  }
+
+  if (everCheated) {
+    const pulse = Math.sin(frame*0.18)*0.3+0.7;
+    ctx.globalAlpha = pulse;
+    ctx.shadowColor = '#ff00ff'; ctx.shadowBlur = 12;
+    ctx.fillStyle = '#ff44ff'; ctx.font = 'bold 16px Impact'; ctx.textAlign = 'center';
+    ctx.fillText('CHEATER', W/2, 22);
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1;
+  }
+
+  if (flyMode) {
+    const btns = [
+      {code:'KeyW', lbl:'▲', ox:0,  oy:-42},
+      {code:'KeyS', lbl:'▼', ox:0,  oy: 42},
+      {code:'KeyA', lbl:'◀', ox:-42, oy:0},
+      {code:'KeyD', lbl:'▶', ox: 42, oy:0},
+    ];
+    const bs = 38;
+    for (const b of btns) {
+      const bx = DPAD_CX + b.ox - bs/2, by = DPAD_CY + b.oy - bs/2;
+      const on = flyKeys[b.code] || touchFlyDir[b.code];
+      ctx.fillStyle   = on ? 'rgba(255,80,255,0.85)' : 'rgba(0,0,0,0.55)';
+      ctx.strokeStyle = on ? '#ff44ff'               : 'rgba(255,255,255,0.35)';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.roundRect(bx, by, bs, bs, 8); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = 'white'; ctx.font = 'bold 18px Arial'; ctx.textAlign = 'center';
+      ctx.fillText(b.lbl, DPAD_CX + b.ox, DPAD_CY + b.oy + 7);
+    }
+  }
+}
+
+// ─── Title screen ─────────────────────────────────────────────
+function drawTitle() {
+  ctx.fillStyle = '#0d0500'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign = 'center';
+
+  ctx.font = '88px serif'; ctx.fillText('🍔', W/2, 115);
+
+  ctx.shadowColor = '#ff3300'; ctx.shadowBlur = 25;
+  ctx.fillStyle = '#ff6600'; ctx.font = 'bold 58px Impact';
+  ctx.fillText('BURGER', W/2, 190);
+  ctx.fillStyle = '#ffdd00';
+  ctx.fillText('RAGE', W/2, 245);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = '#ff9940'; ctx.font = 'bold 16px Arial';
+  ctx.fillText('BATTING PLATFORM MAYHEM', W/2, 272);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.82)'; ctx.font = '13px Arial';
+  ctx.fillText('⚾  Hold SPACE or CLICK to charge your bat', W/2, 318);
+  ctx.fillText('🖱️  Aim with the mouse  •  release to FLING!', W/2, 340);
+  ctx.fillText('🎯  Land on a platform to recharge', W/2, 362);
+  ctx.fillText('⬆️  Climb the burger tower!', W/2, 384);
+
+  ctx.font = '11px Arial'; ctx.fillStyle = '#88cc66';
+  ctx.fillText('🍞 BUN = safe   🧀 BOUNCE   🥬 SLIP   🥒 CRUMBLES   🥓 SOLID (blocks both ways)', W/2, 414);
+
+  const pulse = Math.sin(frame*0.09)*0.3+0.7;
+  ctx.globalAlpha = pulse;
+  ctx.fillStyle = '#ffff00'; ctx.font = 'bold 22px Impact';
+  ctx.fillText('PRESS SPACE OR CLICK TO START', W/2, 480);
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.font = '11px Arial';
+  ctx.fillText('An extremely reasonable game that will not make you angry.', W/2, 515);
+}
+
+// ─── Death screen ─────────────────────────────────────────────
+function drawDead() {
+  ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0,0,W,H);
+  ctx.textAlign = 'center';
+
+  if (wonGame) {
+    ctx.font = '64px serif'; ctx.fillText('🏆', W/2, H/2-95);
+    ctx.shadowColor = '#ffaa00'; ctx.shadowBlur = 18;
+    ctx.fillStyle = '#ffdd00'; ctx.font = 'bold 40px Impact';
+    ctx.fillText('YOU WIN!', W/2, H/2-38);
+    ctx.shadowBlur = 0;
+  } else {
+    ctx.font = '64px serif'; ctx.fillText('💢', W/2, H/2-95);
+    ctx.shadowColor = '#ff0000'; ctx.shadowBlur = 18;
+    ctx.fillStyle = '#ff2200'; ctx.font = 'bold 40px Impact';
+    ctx.fillText('YOU FELL!', W/2, H/2-38);
+    ctx.shadowBlur = 0;
+  }
+
+  ctx.fillStyle = '#ffcc00'; ctx.font = 'bold 17px Arial';
+  ctx.fillText(deathMsg, W/2, H/2+2);
+
+  ctx.fillStyle = 'white'; ctx.font = '15px Arial';
+  ctx.fillText(`Height reached: ${Math.floor(maxH)}m`, W/2, H/2+34);
+
+  if (maxH >= highscore - 0.5 && maxH > 0) {
+    ctx.fillStyle = '#ffdd00'; ctx.font = 'bold 16px Arial';
+    ctx.fillText('⭐  NEW PERSONAL BEST!  ⭐', W/2, H/2+58);
+  }
+
+  if (deathTimer <= 0) {
+    const pulse = Math.sin(frame*0.1)*0.3+0.7;
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = '#ffff00'; ctx.font = 'bold 21px Impact';
+    ctx.fillText('CLICK OR SPACE TO TRY AGAIN', W/2, H/2+105);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ─── Input ────────────────────────────────────────────────────
+const DEATH_MSGS = [
+  'WHAT THE KETCHUP?!', 'SERIOUSLY?!', 'OH COME ON!',
+  'ARE YOU KIDDING ME?!', 'NOT AGAIN!', 'ABSOLUTE GARBAGE!',
+  'I QUIT... just kidding', 'BURGER DOWN!', 'W H Y',
+  'This is fine. 🔥', 'bro just aim better lol',
+  'SKILL ISSUE', 'UNBELIEVABLE', 'IM NEVER PLAYING THIS AGAIN',
+];
+
+function startGame() { genLevel(); P.reset(); frame = 0; state = 'playing'; wonGame = false; everCheated = false; }
+
+function doLaunch() {
+  if (!P.canSwing) return;
+  const pct = Math.min(chargeF/MAX_CHARGE, 1);
+  if (pct < 0.04) { charging = false; chargeF = 0; return; }
+  const power = pct * MAX_POWER;
+  const dx = mouseX - P.x;
+  const dy = mouseY - (P.y - camY);
+  const dist = Math.hypot(dx, dy);
+  if (dist < 1) { charging = false; chargeF = 0; return; }
+  P.launch(power, dx/dist, dy/dist);
+  charging = false; chargeF = 0;
+}
+
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouseX = (e.clientX - r.left) * (W / r.width);
+  mouseY = (e.clientY - r.top)  * (H / r.height);
+});
+
+canvas.addEventListener('mousedown', () => {
+  if (state === 'title') { startGame(); return; }
+  if (state === 'dead' && deathTimer <= 0) { startGame(); return; }
+  if (state === 'playing' && P.canSwing) charging = true;
+});
+
+canvas.addEventListener('mouseup', () => {
+  if (state === 'playing' && charging) doLaunch();
+  charging = false;
+});
+
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (frame - cornerTimer > 300) cornerTapped.clear(); // reset if >5 s since last corner
+  for (const t of e.changedTouches) {
+    const {x, y} = toCanvas(t);
+
+    // mobile cheat: tap all 4 corners to toggle fly mode
+    const corner = detectCorner(x, y);
+    if (corner) {
+      cornerTapped.add(corner);
+      cornerTimer = frame;
+      if (cornerTapped.size === 4) {
+        flyMode = !flyMode;
+        if (flyMode) everCheated = true;
+        cornerTapped.clear();
+      }
+    }
+
+    const dpad = inDpad(x, y);
+    activeTouches[t.identifier] = {x, y, dpad};
+    if (!dpad) {
+      mouseX = x; mouseY = y;
+      if (state === 'title') { startGame(); }
+      else if (state === 'dead' && deathTimer <= 0) { startGame(); }
+      else if (state === 'playing' && P.canSwing) charging = true;
+    }
+  }
+  refreshDpad();
+}, {passive: false});
+
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const {x, y} = toCanvas(t);
+    const rec = activeTouches[t.identifier];
+    if (!rec) continue;
+    rec.x = x; rec.y = y;
+    if (!rec.dpad) { mouseX = x; mouseY = y; }
+  }
+  refreshDpad();
+}, {passive: false});
+
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const rec = activeTouches[t.identifier];
+    if (rec && !rec.dpad && state === 'playing' && charging) { doLaunch(); charging = false; }
+    delete activeTouches[t.identifier];
+  }
+  refreshDpad();
+}, {passive: false});
+
+canvas.addEventListener('touchcancel', e => {
+  for (const t of e.changedTouches) delete activeTouches[t.identifier];
+  refreshDpad();
+}, {passive: false});
+
+document.addEventListener('keydown', e => {
+  flyKeys[e.code] = true;
+  // cheat: type 12359 to toggle WASD fly mode
+  if ('12359'.includes(e.key)) {
+    cheatBuf += e.key;
+    if (cheatBuf.length > 5) cheatBuf = cheatBuf.slice(-5);
+    if (cheatBuf === '12359') { flyMode = !flyMode; if (flyMode) everCheated = true; cheatBuf = ''; }
+  } else if (!'KeyWKeyAKeySKeyD'.includes(e.code)) {
+    cheatBuf = '';
+  }
+  if (e.code === 'Space') {
+    e.preventDefault();
+    if (state === 'title') { startGame(); return; }
+    if (state === 'dead' && deathTimer <= 0) { startGame(); return; }
+    if (state === 'playing' && P.canSwing && !charging) charging = true;
+  }
+});
+
+document.addEventListener('keyup', e => {
+  flyKeys[e.code] = false;
+  if (e.code === 'Space' && state === 'playing' && charging) {
+    doLaunch(); charging = false;
+  }
+});
+
+// ─── Main loop ────────────────────────────────────────────────
+function loop() {
+  frame++;
+  ctx.clearRect(0, 0, W, H);
+
+  if (state === 'title') {
+    drawTitle();
+    requestAnimationFrame(loop);
+    return;
+  }
+
+  camY += (targetCamY - camY) * 0.09;
+
+  if (state === 'dead') {
+    drawBG();
+    platforms.forEach(pl => pl.draw());
+    particles.forEach(p => { p.update(); p.draw(); });
+    particles = particles.filter(p => !p.dead());
+    P.draw();
+    drawDead();
+    if (deathTimer > 0) deathTimer--;
+    requestAnimationFrame(loop);
+    return;
+  }
+
+  if (charging && P.canSwing) chargeF = Math.min(chargeF + 1, MAX_CHARGE);
+
+  platforms.forEach(pl => pl.update());
+  P.update();
+  particles.forEach(p => p.update());
+  particles = particles.filter(p => !p.dead());
+
+  if (P.y > platforms[0].y + 220) {
+    if (maxH > highscore) highscore = maxH;
+    deathMsg = DEATH_MSGS[Math.floor(Math.random()*DEATH_MSGS.length)];
+    deathTimer = 55;
+    state = 'dead';
+  }
+
+  const topPlat = platforms[platforms.length-1];
+  if (P.grounded && P.onPlat === topPlat) {
+    deathMsg = '🏆 YOU REACHED THE TOP! 🏆';
+    if (maxH > highscore) highscore = maxH;
+    deathTimer = 0;
+    wonGame = true;
+    state = 'dead';
+  }
+
+  drawBG();
+  platforms.forEach(pl => pl.draw());
+  drawAim();
+  particles.forEach(p => p.draw());
+  P.draw();
+  drawHUD();
+
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>
